@@ -23,6 +23,12 @@ from rich.table import Table
 from bernstein.adapters._contract import resume_capability, strategy_for
 from bernstein.cli.helpers import console
 from bernstein.core.lifecycle.hooks import HookRegistry, LifecycleContext, LifecycleEvent
+from bernstein.core.persistence.agent_checkpoint import (
+    is_checkpoint_recoverable,
+)
+from bernstein.core.persistence.agent_checkpoint import (
+    load_checkpoint as load_agent_checkpoint,
+)
 from bernstein.core.persistence.resume_prompt import build_resume_context
 from bernstein.core.persistence.task_resume import (
     CheckpointCorruptError,
@@ -39,6 +45,15 @@ EXIT_OK: int = 0
 EXIT_NO_CHECKPOINT: int = 2
 EXIT_CORRUPT: int = 3
 EXIT_HOOK_FAILED: int = 4
+EXIT_GRANT_REFUSED: int = 5
+
+
+class GrantRefusedError(RuntimeError):
+    """Raised when the agent's grant no longer matches current configuration.
+
+    The message names which field moved (role narrowed, task reassigned,
+    parent cancelled) so the operator can act without reading source.
+    """
 
 
 @dataclass(frozen=True)
@@ -82,6 +97,20 @@ def prepare_resume(
     # Reading once before the bump gives us a clear error path: if the
     # file is corrupt we exit before incrementing the counter.
     load_checkpoint(workdir, task_id)
+
+    # --- Grant authority check (issue #3649) ---
+    # Look up the AgentCheckpoint for this task (written by the orchestrator
+    # at suspend time).  If it carries a grant_hash we verify the current
+    # configuration still matches before taking any side effect (bump,
+    # hook, signal).  A narrowed role, reassigned task, or cancelled parent
+    # causes an explicit refusal that names which field moved.
+    _runtime_dir = workdir / ".sdd" / "runtime"
+    _agent_checkpoint = load_agent_checkpoint(task_id, _runtime_dir)
+    if _agent_checkpoint is not None:
+        _ok, _reason = is_checkpoint_recoverable(_agent_checkpoint)
+        if not _ok:
+            raise GrantRefusedError(_reason)
+
     checkpoint = bump_resume_count(workdir, task_id)
     adapter_name = checkpoint.adapter or ""
     capability = resume_capability(adapter_name)
@@ -185,6 +214,7 @@ def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: b
         2  no checkpoint on disk
         3  checkpoint corrupt / failed schema validation
         4  task.resume lifecycle hook failed
+        5  grant mismatch — role narrowed, task reassigned, or parent cancelled
     """
     project_root = workdir or Path.cwd()
     try:
@@ -199,6 +229,13 @@ def resume_cmd(task_id: str, workdir: Path | None, output_json: bool, dry_run: b
             "[dim]Inspect the file under .sdd/runtime/checkpoints/<task-id>/ and remove it to run the task fresh.[/dim]"
         )
         raise SystemExit(EXIT_CORRUPT) from None
+    except GrantRefusedError as exc:
+        console.print(f"[red]Grant mismatch — resume refused:[/red] {exc}")
+        console.print(
+            "[dim]The role's permissions, task assignment, or parent run changed since this"
+            " checkpoint was written. Re-run the task from scratch or restore the original grant.[/dim]"
+        )
+        raise SystemExit(EXIT_GRANT_REFUSED) from None
 
     _render_plan(project_root, plan, output_json=output_json)
 
