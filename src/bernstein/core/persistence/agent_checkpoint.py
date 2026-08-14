@@ -15,7 +15,7 @@ captures a hash of the grant that was live: role name, resolved
 At resume time :func:`is_checkpoint_recoverable` re-derives the current grant
 from the same inputs and compares hashes **before** any side effect is taken.
 A narrowed role, reassigned task, or cancelled parent causes an explicit refusal
-that names which field changed.
+naming the bindings the grant hash covers.
 
 A successful resume appends a :class:`ContinuationEntry` to the run journal
 binding ``(checkpoint_hash, grant_hash, chain_head_at_suspend,
@@ -192,6 +192,33 @@ def load_checkpoint(agent_id: str, runtime_dir: Path) -> AgentCheckpoint | None:
     return AgentCheckpoint(**json.loads(path.read_text()))
 
 
+def find_checkpoint_for_task(task_id: str, runtime_dir: Path) -> AgentCheckpoint | None:
+    """Find the checkpoint for ``task_id`` across all agent directories.
+
+    Checkpoints are stored per **agent** (``agents/{agent_id}/checkpoint.json``)
+    while resume is driven by **task**, so callers resolving a task must scan
+    rather than key by id — looking up ``agents/{task_id}/`` would silently
+    miss every real checkpoint. Returns the newest match (``checkpointed_at``)
+    when several agents checkpointed the same task; ``None`` when none did.
+    """
+    agents_dir = runtime_dir / "agents"
+    if not agents_dir.is_dir():
+        return None
+    best: AgentCheckpoint | None = None
+    for path in agents_dir.glob(f"*/{_CHECKPOINT_FILENAME}"):
+        try:
+            candidate = AgentCheckpoint(**json.loads(path.read_text()))
+        except (OSError, TypeError, ValueError):
+            # A single unreadable checkpoint must not block resume of
+            # unrelated tasks; corrupt files surface via scan tooling.
+            continue
+        if candidate.task_id != task_id:
+            continue
+        if best is None or candidate.checkpointed_at > best.checkpointed_at:
+            best = candidate
+    return best
+
+
 def scan_orphaned_checkpoints(runtime_dir: Path) -> list[AgentCheckpoint]:
     """Find all checkpoints whose owning process is no longer alive.
 
@@ -297,35 +324,16 @@ def is_checkpoint_recoverable(
             chain_head=checkpoint.chain_head_at_suspend,
         )
         if expected_hash != checkpoint.grant_hash:
-            # Re-derive components of the original grant to produce a
-            # human-readable diff in the refusal message.
-            orig_fields: list[str] = []
-
-            # Role change: we can't know the original role's perms, but if
-            # the role field itself differs that's already caught by the hash.
-            # Check each structural dimension for a useful message.
-            current_allowed = sorted(current_perms.allowed_paths)
-            current_denied = sorted(current_perms.denied_paths)
-
-            # Probe: does the hash match if we only change paths? (role same)
-            # This gives operators a precise "which field moved" message.
-            _probe_same_role = compute_grant_hash(
-                role=checkpoint.role,
-                permissions=AgentPermissions(
-                    allowed_paths=tuple(current_allowed),
-                    denied_paths=tuple(current_denied),
-                ),
-                task_id=checkpoint.task_id,
-                parent_run_id=checkpoint.parent_run_id,
-                chain_head=checkpoint.chain_head_at_suspend,
+            # Only the hash of the suspend-time grant is stored, so the
+            # refusal cannot prove which single input moved; it names the
+            # bindings the hash covers so the operator knows where to look.
+            reason = (
+                "grant mismatch — resume refused before first side effect; "
+                f"role '{checkpoint.role}' permissions narrowed or changed, "
+                f"or a grant-bound field no longer matches (task "
+                f"'{checkpoint.task_id}', parent run '{checkpoint.parent_run_id}', "
+                "chain head at suspend)"
             )
-            if _probe_same_role != checkpoint.grant_hash:
-                orig_fields.append(f"role '{checkpoint.role}' allowed_paths or denied_paths narrowed")
-
-            if not orig_fields:
-                orig_fields.append("grant configuration changed")
-
-            reason = "grant mismatch — resume refused before first side effect; " + "; ".join(orig_fields)
             return False, reason
 
     # --- Liveness checks (only reached when grant is valid or absent) ---

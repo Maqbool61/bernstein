@@ -24,10 +24,8 @@ from bernstein.adapters._contract import resume_capability, strategy_for
 from bernstein.cli.helpers import console
 from bernstein.core.lifecycle.hooks import HookRegistry, LifecycleContext, LifecycleEvent
 from bernstein.core.persistence.agent_checkpoint import (
+    find_checkpoint_for_task,
     is_checkpoint_recoverable,
-)
-from bernstein.core.persistence.agent_checkpoint import (
-    load_checkpoint as load_agent_checkpoint,
 )
 from bernstein.core.persistence.resume_prompt import build_resume_context
 from bernstein.core.persistence.task_resume import (
@@ -51,8 +49,9 @@ EXIT_GRANT_REFUSED: int = 5
 class GrantRefusedError(RuntimeError):
     """Raised when the agent's grant no longer matches current configuration.
 
-    The message names which field moved (role narrowed, task reassigned,
-    parent cancelled) so the operator can act without reading source.
+    The message names the grant bindings the stored hash covers (role
+    permissions, task, parent run, chain head) so the operator can act
+    without reading source.
     """
 
 
@@ -100,12 +99,13 @@ def prepare_resume(
 
     # --- Grant authority check (issue #3649) ---
     # Look up the AgentCheckpoint for this task (written by the orchestrator
-    # at suspend time).  If it carries a grant_hash we verify the current
+    # at suspend time).  Checkpoints are stored per agent, so the lookup
+    # scans for the task rather than treating the task id as an agent id.
+    # If the checkpoint carries a grant_hash we verify the current
     # configuration still matches before taking any side effect (bump,
-    # hook, signal).  A narrowed role, reassigned task, or cancelled parent
-    # causes an explicit refusal that names which field moved.
+    # hook, signal); a stale grant refuses with the bindings named.
     _runtime_dir = workdir / ".sdd" / "runtime"
-    _agent_checkpoint = load_agent_checkpoint(task_id, _runtime_dir)
+    _agent_checkpoint = find_checkpoint_for_task(task_id, _runtime_dir)
     if _agent_checkpoint is not None:
         _ok, _reason = is_checkpoint_recoverable(_agent_checkpoint)
         if not _ok:

@@ -31,6 +31,7 @@ from bernstein.core.persistence.agent_checkpoint import (
     build_continuation_entry,
     checkpoint_hash,
     compute_grant_hash,
+    find_checkpoint_for_task,
     is_checkpoint_recoverable,
     save_checkpoint,
 )
@@ -434,3 +435,66 @@ class TestGrantFieldsRoundtrip:
         assert loaded.grant_hash == gh
         assert loaded.parent_run_id == "r-1"
         assert loaded.chain_head_at_suspend == "chainabc"
+
+
+# ---------------------------------------------------------------------------
+# CLI lookup path — task-keyed resolution over agent-keyed storage
+# ---------------------------------------------------------------------------
+
+
+class TestFindCheckpointForTask:
+    def test_resolves_agent_keyed_storage_by_task_id(self, tmp_path: Path) -> None:
+        """``prepare_resume`` knows only the task id, but checkpoints live
+        under ``agents/{agent_id}/``. The lookup must bridge the two: keying
+        the load by task id directly would return None for every real
+        checkpoint and silently skip the authority check."""
+        perms = get_permissions_for_role("backend")
+        gh = compute_grant_hash("backend", perms, "task-cli", "run-7", "headx")
+        cp = AgentCheckpoint(
+            agent_id="agent-alpha",
+            task_id="task-cli",
+            worktree_path="/tmp/wt",
+            role="backend",
+            grant_hash=gh,
+            parent_run_id="run-7",
+            chain_head_at_suspend="headx",
+        )
+        save_checkpoint(cp, tmp_path)
+
+        found = find_checkpoint_for_task("task-cli", tmp_path)
+        assert found is not None
+        assert found.agent_id == "agent-alpha"
+        assert found.grant_hash == gh
+        # The agent id is not a task id — it must not resolve.
+        assert find_checkpoint_for_task("agent-alpha", tmp_path) is None
+
+    def test_newest_checkpoint_wins_for_duplicated_task(self, tmp_path: Path) -> None:
+        for agent_id, ts in (("a-old", 1_000.0), ("a-new", 2_000.0)):
+            save_checkpoint(
+                AgentCheckpoint(
+                    agent_id=agent_id,
+                    task_id="task-dup",
+                    worktree_path="/tmp/wt",
+                    checkpointed_at=ts,
+                ),
+                tmp_path,
+            )
+        found = find_checkpoint_for_task("task-dup", tmp_path)
+        assert found is not None
+        assert found.agent_id == "a-new"
+
+    def test_missing_agents_dir_is_none(self, tmp_path: Path) -> None:
+        assert find_checkpoint_for_task("task-x", tmp_path / "absent") is None
+
+    def test_corrupt_sibling_checkpoint_does_not_block(self, tmp_path: Path) -> None:
+        """One unreadable checkpoint must not break resume of other tasks."""
+        bad_dir = tmp_path / "agents" / "agent-bad"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "checkpoint.json").write_text("{not json")
+        save_checkpoint(
+            AgentCheckpoint(agent_id="agent-ok", task_id="task-ok", worktree_path="/tmp/wt"),
+            tmp_path,
+        )
+        found = find_checkpoint_for_task("task-ok", tmp_path)
+        assert found is not None
+        assert found.agent_id == "agent-ok"
