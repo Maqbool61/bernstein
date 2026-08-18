@@ -102,6 +102,15 @@ JOURNAL_EVENT_SUSPEND = "task.suspend"
 #: Event-journal row type for a recorded durable resume (wake).
 JOURNAL_EVENT_RESUME = "task.resume"
 
+#: Event-journal row type for the authenticated grant-continuation entry
+#: appended immediately after a successful resume.  Binds
+#: ``(checkpoint_hash, grant_hash, chain_head_at_suspend, chain_head_at_resume)``
+#: so a verifier can chain suspend -> resume with no filesystem access.
+#: Absence of this row for a given resume means the resumed run never
+#: completed its first authority check; the verifier treats the run as a
+#: *new* run, never as a continuation.
+JOURNAL_EVENT_GRANT_CONTINUATION = "task.grant_continuation"
+
 #: Canonical resource kinds a park releases, each referencing the suspend
 #: receipt hash. ``budget`` is always released (headroom returns to the pool);
 #: ``process`` / ``sandbox`` / ``seat`` release when a handle is supplied.
@@ -875,6 +884,22 @@ class ParkResult:
     ledger_entry_hash: str
 
 
+def _find_checkpoint_for_task_safe(task_id: str, runtime_dir: Path) -> object | None:
+    """Return the AgentCheckpoint for ``task_id`` or ``None`` on any error.
+
+    Imported lazily to avoid a circular dependency between the suspension
+    module and the agent_checkpoint module at import time.
+    """
+    try:
+        from bernstein.core.persistence.agent_checkpoint import (
+            find_checkpoint_for_task as _fct,
+        )
+
+        return _fct(task_id, runtime_dir)
+    except Exception:
+        return None
+
+
 def park_task(
     *,
     sdd_dir: Path,
@@ -991,6 +1016,38 @@ def park_task(
             },
         )
         ledger_entry_hash = entry.entry_hash
+
+    # --- Suspend-side grant population (issue #3649) ---
+    # Re-read the AgentCheckpoint for this task (written at spawn time by
+    # the orchestrator) and stamp the three grant fields that were not known
+    # until the journal row landed: grant_hash, chain_head_at_suspend, and
+    # — if absent — role and parent_run_id.  The checkpoint is only updated
+    # when one already exists; tasks that pre-date agent_checkpoint.py have
+    # no checkpoint to update and resume unchanged (backward compat).
+    _runtime_dir = sdd_dir / "runtime"
+    _existing_cp = _find_checkpoint_for_task_safe(task_id, _runtime_dir)
+    if _existing_cp is not None:
+        from bernstein.core.persistence.agent_checkpoint import (
+            compute_grant_hash as _compute_grant_hash,
+        )
+        from bernstein.core.persistence.agent_checkpoint import (
+            save_checkpoint as _save_checkpoint,
+        )
+        from bernstein.core.security.permissions import get_permissions_for_role as _gp4r
+
+        _role = _existing_cp.role
+        _parent_run_id = _existing_cp.parent_run_id
+        _chain_head = suspend_row.event_hash
+        _perms = _gp4r(_role)
+        _grant_hash = _compute_grant_hash(_role, _perms, task_id, _parent_run_id, _chain_head)
+        from dataclasses import replace as _replace
+
+        _updated_cp = _replace(
+            _existing_cp,
+            grant_hash=_grant_hash,
+            chain_head_at_suspend=_chain_head,
+        )
+        _save_checkpoint(_updated_cp, _runtime_dir)
 
     return ParkResult(
         suspend_row=suspend_row,
@@ -1164,6 +1221,29 @@ def resume_task(
         msg = f"resume journal append failed for task {suspend_row.task_id!r}"
         raise RuntimeError(msg)
     resume_event_hash = journal.head()
+
+    # --- Journal append of ContinuationEntry (issue #3649) ---
+    # Look up the AgentCheckpoint for this task.  If it carries a grant_hash
+    # (populated at suspend time by park_task), append a task.grant_continuation
+    # row that binds (checkpoint_hash, grant_hash, chain_head_at_suspend,
+    # chain_head_at_resume).  A verifier can then chain suspend → resume with
+    # no filesystem access.  Tasks without a checkpoint (pre-#3649) produce no
+    # continuation row; the verifier treats absence as a new run.
+    _cp_for_cont = _find_checkpoint_for_task_safe(suspend_row.task_id, sdd_dir / "runtime")
+    if _cp_for_cont is not None and _cp_for_cont.grant_hash:
+        from bernstein.core.persistence.agent_checkpoint import (
+            build_continuation_entry as _bce,
+        )
+
+        _entry = _bce(_cp_for_cont, chain_head_at_resume=resume_event_hash)
+        journal.record(
+            JOURNAL_EVENT_GRANT_CONTINUATION,
+            task_id=suspend_row.task_id,
+            checkpoint_hash=_entry.checkpoint_hash,
+            grant_hash=_entry.grant_hash,
+            chain_head_at_suspend=_entry.chain_head_at_suspend,
+            chain_head_at_resume=_entry.chain_head_at_resume,
+        )
 
     receipt = record_task_resume(
         chain=chain,
@@ -1551,6 +1631,7 @@ __all__ = [
     "CONTINUITY_FAILED",
     "CONTINUITY_PENDING",
     "CONTINUITY_VERIFIED",
+    "JOURNAL_EVENT_GRANT_CONTINUATION",
     "JOURNAL_EVENT_RESUME",
     "JOURNAL_EVENT_SUSPEND",
     "RESOURCE_BUDGET",
