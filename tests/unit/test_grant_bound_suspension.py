@@ -13,10 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from bernstein.core.persistence.agent_checkpoint import (
-    AgentCheckpoint,
     compute_grant_hash,
     find_checkpoint_for_task,
-    save_checkpoint,
 )
 from bernstein.core.replay.journal import load_events
 from bernstein.core.security.audit_chain import AuditChainStore
@@ -53,22 +51,18 @@ def _park(
     task_id: str = "T-grant",
     role: str = "backend",
     parent_run_id: str = "run-42",
-    agent_id: str = "agent-1",
 ) -> tuple[SuspendRow, str, AuditChainStore]:
-    """Park a task and return (suspend_row, suspend_receipt_hash, chain)."""
+    """Park a task with a grant-bound checkpoint.
+
+    ``park_task`` is the writer of the checkpoint, so the role and the owning
+    run are handed to it rather than pre-seeded on disk: a checkpoint written
+    before the park carries no suspend-row hash to bind the grant to.
+
+    Returns ``(suspend_row, suspend_receipt_hash, chain)``.
+    """
     sdd = tmp_path / ".sdd"
     chain = _chain(tmp_path)
     wt = _worktree(tmp_path)
-
-    # Pre-populate an AgentCheckpoint so park_task can read role/parent_run_id
-    cp = AgentCheckpoint(
-        agent_id=agent_id,
-        task_id=task_id,
-        worktree_path=str(wt),
-        role=role,
-        parent_run_id=parent_run_id,
-    )
-    save_checkpoint(cp, sdd / "runtime")
 
     result = park_task(
         sdd_dir=sdd,
@@ -80,6 +74,8 @@ def _park(
         reserved_usd=5.0,
         spent_usd=1.0,
         chain=chain,
+        role=role,
+        parent_run_id=parent_run_id,
     )
     return result.suspend_row, result.suspend_receipt_hash, chain
 
@@ -92,34 +88,9 @@ def _park(
 class TestSuspendSideGrantPopulation:
     def test_park_writes_grant_hash_to_checkpoint(self, tmp_path: Path) -> None:
         """park_task() must populate grant_hash on the stored AgentCheckpoint."""
-        task_id = "T-susp-grant"
-        role = "backend"
-        sdd = tmp_path / ".sdd"
-        chain = _chain(tmp_path)
-        wt = _worktree(tmp_path)
+        _park(tmp_path, task_id="T-susp-grant")
 
-        cp = AgentCheckpoint(
-            agent_id="ag-1",
-            task_id=task_id,
-            worktree_path=str(wt),
-            role=role,
-            parent_run_id="run-1",
-        )
-        save_checkpoint(cp, sdd / "runtime")
-
-        park_task(
-            sdd_dir=sdd,
-            task_id=task_id,
-            adapter="claude",
-            session_id="s",
-            worktree_path=wt,
-            envelope="subscription",
-            reserved_usd=5.0,
-            spent_usd=1.0,
-            chain=chain,
-        )
-
-        updated = find_checkpoint_for_task(task_id, sdd / "runtime")
+        updated = find_checkpoint_for_task("T-susp-grant", tmp_path / ".sdd" / "runtime")
         assert updated is not None
         assert updated.grant_hash != "", "grant_hash must be populated after park"
 
@@ -128,38 +99,14 @@ class TestSuspendSideGrantPopulation:
         task_id = "T-hash-correct"
         role = "backend"
         parent_run_id = "run-99"
-        sdd = tmp_path / ".sdd"
-        chain = _chain(tmp_path)
-        wt = _worktree(tmp_path)
+        _park(tmp_path, task_id=task_id, role=role, parent_run_id=parent_run_id)
 
-        cp = AgentCheckpoint(
-            agent_id="ag-2",
-            task_id=task_id,
-            worktree_path=str(wt),
-            role=role,
-            parent_run_id=parent_run_id,
-        )
-        save_checkpoint(cp, sdd / "runtime")
-
-        park_task(
-            sdd_dir=sdd,
-            task_id=task_id,
-            adapter="claude",
-            session_id="s",
-            worktree_path=wt,
-            envelope="subscription",
-            reserved_usd=5.0,
-            spent_usd=1.0,
-            chain=chain,
-        )
-
-        updated = find_checkpoint_for_task(task_id, sdd / "runtime")
+        updated = find_checkpoint_for_task(task_id, tmp_path / ".sdd" / "runtime")
         assert updated is not None
 
-        perms = get_permissions_for_role(role)
         expected = compute_grant_hash(
             role,
-            perms,
+            get_permissions_for_role(role),
             task_id,
             parent_run_id,
             updated.chain_head_at_suspend,
@@ -169,84 +116,37 @@ class TestSuspendSideGrantPopulation:
     def test_park_populates_chain_head_at_suspend(self, tmp_path: Path) -> None:
         """chain_head_at_suspend must equal the suspend row's event_hash."""
         task_id = "T-chain-head"
-        sdd = tmp_path / ".sdd"
-        chain = _chain(tmp_path)
-        wt = _worktree(tmp_path)
+        suspend_row, _receipt_hash, _chain_store = _park(tmp_path, task_id=task_id)
 
-        cp = AgentCheckpoint(
-            agent_id="ag-3",
-            task_id=task_id,
-            worktree_path=str(wt),
-            role="backend",
-            parent_run_id="run-1",
-        )
-        save_checkpoint(cp, sdd / "runtime")
-
-        result = park_task(
-            sdd_dir=sdd,
-            task_id=task_id,
-            adapter="claude",
-            session_id="s",
-            worktree_path=wt,
-            envelope="subscription",
-            reserved_usd=5.0,
-            spent_usd=1.0,
-            chain=chain,
-        )
-
-        updated = find_checkpoint_for_task(task_id, sdd / "runtime")
+        updated = find_checkpoint_for_task(task_id, tmp_path / ".sdd" / "runtime")
         assert updated is not None
-        assert updated.chain_head_at_suspend == result.suspend_row.event_hash
+        assert updated.chain_head_at_suspend == suspend_row.event_hash
 
     def test_park_populates_role_and_parent_run_id(self, tmp_path: Path) -> None:
-        """role and parent_run_id must be preserved from the existing checkpoint."""
+        """role and parent_run_id must reach the checkpoint the resume re-derives from."""
         task_id = "T-role-parent"
-        role = "qa"
-        parent_run_id = "run-777"
-        sdd = tmp_path / ".sdd"
-        chain = _chain(tmp_path)
-        wt = _worktree(tmp_path)
+        _park(tmp_path, task_id=task_id, role="qa", parent_run_id="run-777")
 
-        cp = AgentCheckpoint(
-            agent_id="ag-4",
-            task_id=task_id,
-            worktree_path=str(wt),
-            role=role,
-            parent_run_id=parent_run_id,
-        )
-        save_checkpoint(cp, sdd / "runtime")
-
-        park_task(
-            sdd_dir=sdd,
-            task_id=task_id,
-            adapter="claude",
-            session_id="s",
-            worktree_path=wt,
-            envelope="subscription",
-            reserved_usd=5.0,
-            spent_usd=1.0,
-            chain=chain,
-        )
-
-        updated = find_checkpoint_for_task(task_id, sdd / "runtime")
+        updated = find_checkpoint_for_task(task_id, tmp_path / ".sdd" / "runtime")
         assert updated is not None
-        assert updated.role == role
-        assert updated.parent_run_id == parent_run_id
+        assert updated.role == "qa"
+        assert updated.parent_run_id == "run-777"
 
-    def test_park_without_prior_checkpoint_does_not_raise(self, tmp_path: Path) -> None:
-        """park_task() without a pre-existing AgentCheckpoint must not fail.
+    def test_park_without_a_role_writes_no_grant(self, tmp_path: Path) -> None:
+        """A park that cannot source a role writes an empty grant, and does not fail.
 
-        Grant fields remain empty in this case — backward compat for tasks
-        that were not spawned with agent_checkpoint.py.
+        ``get_permissions_for_role("")`` is the *unrestricted* permission set,
+        which the resume would re-derive identically -- so hashing it would
+        produce a checkpoint that reads as grant-bound and can never refuse.
+        Absence has to stay absence.
         """
         sdd = tmp_path / ".sdd"
         chain = _chain(tmp_path)
         wt = _worktree(tmp_path)
 
-        # No prior checkpoint written
         result = park_task(
             sdd_dir=sdd,
-            task_id="T-no-prior",
+            task_id="T-no-role",
             adapter="claude",
             session_id="s",
             worktree_path=wt,
@@ -255,7 +155,12 @@ class TestSuspendSideGrantPopulation:
             spent_usd=1.0,
             chain=chain,
         )
-        assert result.suspend_row.task_id == "T-no-prior"
+        assert result.suspend_row.task_id == "T-no-role"
+
+        written = find_checkpoint_for_task("T-no-role", sdd / "runtime")
+        assert written is not None
+        assert written.role == ""
+        assert written.grant_hash == ""
 
 
 # ---------------------------------------------------------------------------
@@ -337,17 +242,57 @@ class TestJournalContinuationEntry:
         cont_idx = next(i for i, e in enumerate(event_types) if e == JOURNAL_EVENT_GRANT_CONTINUATION)
         assert cont_idx > resume_idx
 
-    def test_no_continuation_row_without_checkpoint(self, tmp_path: Path) -> None:
-        """If no AgentCheckpoint exists for the task, no continuation row is written.
+    def test_resume_receipt_journal_index_names_the_resume_row(self, tmp_path: Path) -> None:
+        """The receipt's journal_index and resume_event_hash must name the same row.
 
-        This is the backward-compat path: old tasks that never had a checkpoint
-        resume normally and simply produce no continuation evidence.
+        The continuation row is appended between the resume append and the
+        receipt, so an index read afterwards names the continuation row while
+        ``resume_event_hash`` still names the resume row -- one signed receipt
+        describing two. The suspend side already refuses exactly that mismatch
+        (``verify_suspension_receipt``), so the resume side must not write one.
+        """
+        from bernstein.core.security.audit_chain import EVENT_TASK_RESUMED
+        from bernstein.core.tasks.checkpoint_retry import task_run_id
+
+        task_id = "T-resume-index"
+        suspend_row, receipt_hash, chain = _park(tmp_path, task_id=task_id)
+        sdd = tmp_path / ".sdd"
+        wt2 = _worktree(tmp_path, "wt2")
+
+        result = resume_task(
+            sdd_dir=sdd,
+            suspend_row=suspend_row,
+            new_worktree_path=wt2,
+            chain=chain,
+            suspend_receipt_hash=receipt_hash,
+        )
+
+        journal_path = sdd / "runs" / task_run_id(task_id) / "journal.jsonl"
+        events = load_events(journal_path).events
+        # The continuation row must actually be there, or this proves nothing.
+        assert any(e.get("event") == JOURNAL_EVENT_GRANT_CONTINUATION for e in events)
+
+        scan = chain.scan_verified(event_type=EVENT_TASK_RESUMED)
+        assert scan.ok, scan.errors
+        receipt = next(e for e in scan.events if e.details.get("task_id") == task_id)
+        index = int(receipt.details["journal_index"])
+
+        assert events[index].get("event") == "task.resume"
+        assert receipt.details["resume_event_hash"] == result.resume_event_hash
+
+    def test_no_continuation_row_when_the_checkpoint_carries_no_grant(self, tmp_path: Path) -> None:
+        """A checkpoint with no grant produces no continuation evidence.
+
+        Continuation is a claim about authority, so it is written only when
+        there is an authority to name. A park with no role -- and a task old
+        enough to have no checkpoint at all -- both resume normally and simply
+        leave no continuation row, which the verifier reads as a new run.
         """
         sdd = tmp_path / ".sdd"
         chain = _chain(tmp_path)
         wt = _worktree(tmp_path)
 
-        # Park without a pre-existing AgentCheckpoint
+        # Park with no role: the checkpoint is written with an empty grant_hash.
         result = park_task(
             sdd_dir=sdd,
             task_id="T-no-cp",
@@ -374,4 +319,4 @@ class TestJournalContinuationEntry:
         journal_path = sdd / "runs" / task_run_id("T-no-cp") / "journal.jsonl"
         events = load_events(journal_path).events
         continuation_rows = [e for e in events if e.get("event") == JOURNAL_EVENT_GRANT_CONTINUATION]
-        assert continuation_rows == [], "No continuation row should appear when no checkpoint exists"
+        assert continuation_rows == [], "No continuation row should appear when the checkpoint carries no grant"
