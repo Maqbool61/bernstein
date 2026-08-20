@@ -181,7 +181,6 @@ together, without reading `.sdd/runtime/`. A park that wrote no grant produces
 no continuation row, and a task with no checkpoint at all produces none either;
 in both cases the verifier reads the resumed run as a new run rather than as an
 attested continuation.
-
 ## Commands
 
 ```bash
